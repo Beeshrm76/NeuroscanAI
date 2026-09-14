@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+instance/
+.vscode/
+node_modules
+*.zip
+models/_old_broken_preprocessing/*
