@@ -13,12 +13,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras.applications import VGG16, ResNet50, MobileNetV2, DenseNet121, EfficientNetB0
-from tensorflow.keras.applications.vgg16 import preprocess_input as vgg16_preprocess
-from tensorflow.keras.applications.resnet50 import preprocess_input as resnet50_preprocess
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
-from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
-from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
 from tensorflow.keras.models import Model
@@ -26,65 +22,38 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.utils.class_weight import compute_class_weight
 
-# WHY THIS FILE CHANGED (round 2): fine-tuning + class weighting
-# -----------------------------------------------------------------
-# Two cheap, legitimate levers were left untried after the preprocessing
-# fix:
+# WHY THIS FILE EXISTS
+# ----------------------
+# Adds InceptionV3 as a 6th architecture, trained on its own without
+# retraining any of the existing 5 models (VGG16, ResNet50, MobileNetV2,
+# DenseNet121, EfficientNetB0), which were already trained via
+# train_multi.py. InceptionV3 was chosen for ensemble DIVERSITY: its
+# multi-branch inception modules (parallel kernel sizes per layer) are
+# architecturally different from every model already in this project,
+# which tends to help an ensemble more than adding another model with a
+# similar inductive bias. It's also historically strong on medical
+# imaging specifically, and lighter than ResNet50 despite comparable
+# depth, so it should train faster on CPU.
 #
-# 1. FULLY FROZEN BACKBONES. Every base_model layer was frozen for the
-#    entire run, so training only ever adjusted the small custom head
-#    (GlobalAveragePooling2D -> Dense(256) -> Dense(num_classes)). That
-#    caps how well ImageNet-generic features can be reshaped toward
-#    MRI-specific tumor features. Standard transfer-learning practice is
-#    a SECOND phase: unfreeze the last ~20% of backbone layers and
-#    continue training at a much lower learning rate (1e-5 vs the head's
-#    1e-4), so the backbone adapts slightly without catastrophically
-#    forgetting its pretrained weights. This is implemented below as
-#    STAGE 1 (frozen head, existing behavior) -> STAGE 2 (fine-tune).
+# This script is deliberately structured identically to train_multi.py
+# (same MODEL_CONFIGS pattern, same make_generators/unfreeze_top_fraction
+# helpers, same two-stage frozen-head -> fine-tune loop, same class
+# weighting) so InceptionV3 is trained under the exact same regimen and
+# is directly comparable to the other 5 models - it's just scoped down
+# to run standalone for this one architecture instead of retraining
+# everything.
 #
-# 2. NO CLASS WEIGHTING. Class sizes in this dataset range from 18 to
-#    367 images (~20x imbalance per the manifest). Unweighted
-#    categorical_crossentropy lets the loss be dominated by the largest
-#    classes, so the model can reach a deceptively OK-looking overall
-#    accuracy while doing poorly on rare classes - which is exactly what
-#    macro-F1 in evaluate_all.py would expose. compute_class_weight
-#    ('balanced') is now computed once from the training generator's
-#    labels and passed to BOTH fit() calls (frozen + fine-tune stages),
-#    so under-represented classes contribute proportionally more to the
-#    loss.
+# Uses InceptionV3's own correct preprocess_input (scales to [-1, 1], NOT
+# a generic 0-1 rescale - same class of bug already fixed for the other 5
+# models in train_multi.py).
 #
-# Both changes are applied identically to every architecture in
-# MODEL_CONFIGS so results stay comparable across the ensemble.
+# Usage:
+#     python train_inception.py
+# Output: models/inception_model.h5
 
 FINE_TUNE_EPOCHS = 15
 FINE_TUNE_LR = 1e-5
 FINE_TUNE_UNFREEZE_FRACTION = 0.20  # unfreeze the last 20% of backbone layers
-
-# WHY THIS FILE CHANGED
-# ----------------------
-# The previous version reused preprocess.get_data_generators() for every
-# architecture, which applies one shared `rescale=1./255` to all five
-# models. That is correct for a from-scratch CNN, but every ImageNet-
-# pretrained backbone here expects its OWN specific input convention:
-#   - EfficientNet expects raw 0-255 input (it rescales internally) ->
-#     pre-scaling to 0-1 broke it completely (flat ~8% accuracy, never
-#     learned, across all 25 epochs in the previous run).
-#   - ResNet50 expects Caffe-style preprocessing (BGR order, per-channel
-#     mean subtraction, unscaled) -> the mismatch is the most likely
-#     reason it only reached ~21% val accuracy.
-#   - VGG16 expects a similar mean-centered input -> likely capped its
-#     climb to ~45% val accuracy despite still improving at epoch 25.
-#   - MobileNetV2 and DenseNet121 happened to tolerate the mismatch well
-#     enough to still train reasonably (~70% and ~65%), but are not
-#     guaranteed to be at their true ceiling either.
-#
-# This script now builds a SEPARATE pair of train/val ImageDataGenerators
-# per architecture, each using that architecture's own
-# `keras.applications.<name>.preprocess_input` function, so every frozen
-# pretrained backbone receives the input distribution it was actually
-# trained on. Train/Validation/Testing folder paths and the underlying
-# patient/content-deduplicated split are unchanged - only the pixel
-# preprocessing changes here.
 
 DEFAULT_IMG_SIZE = (150, 150)
 BATCH_SIZE = 32
@@ -93,37 +62,12 @@ VAL_DIR = 'dataset/Validation'
 
 os.makedirs('models', exist_ok=True)
 
+# Same shape as train_multi.py's MODEL_CONFIGS, scoped to just InceptionV3.
 # Each entry: (model builder fn, correct preprocess_input fn, input size)
-# ResNet50 uses 224x224 (its native ImageNet training resolution) instead
-# of the shared 150x150 default. At 150x150, ResNet50's deeper stack of
-# stride-2 downsampling stages collapses spatial resolution to almost
-# nothing by the final feature map, which independently cripples feature
-# quality regardless of preprocessing - this showed up as near-identical,
-# still-stuck accuracy (~15-16%) even after fixing preprocess_input.
 MODEL_CONFIGS = {
-    'vgg16': (
-        lambda: VGG16(weights='imagenet', include_top=False, input_shape=(150, 150, 3)),
-        vgg16_preprocess,
-        (150, 150),
-    ),
-    'resnet50': (
-        lambda: ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3)),
-        resnet50_preprocess,
-        (224, 224),
-    ),
-    'mobilenet': (
-        lambda: MobileNetV2(weights='imagenet', include_top=False, input_shape=(150, 150, 3)),
-        mobilenet_preprocess,
-        (150, 150),
-    ),
-    'densenet': (
-        lambda: DenseNet121(weights='imagenet', include_top=False, input_shape=(150, 150, 3)),
-        densenet_preprocess,
-        (150, 150),
-    ),
-    'efficientnet': (
-        lambda: EfficientNetB0(weights='imagenet', include_top=False, input_shape=(150, 150, 3)),
-        efficientnet_preprocess,
+    'inception': (
+        lambda: InceptionV3(weights='imagenet', include_top=False, input_shape=(150, 150, 3)),
+        inception_preprocess,
         (150, 150),
     ),
 }
@@ -152,7 +96,7 @@ def make_generators(preprocess_fn, img_size):
 
 
 # Only need num_classes once - any generator will report the same count
-_probe_gen, _ = make_generators(vgg16_preprocess, DEFAULT_IMG_SIZE)
+_probe_gen, _ = make_generators(inception_preprocess, DEFAULT_IMG_SIZE)
 num_classes = _probe_gen.num_classes
 print(f"Detected {num_classes} classes for training.")
 
@@ -338,5 +282,6 @@ for model_name, (build_base_model, preprocess_fn, img_size) in MODEL_CONFIGS.ite
     print(f"--- {model_name.upper()} model successfully saved to {save_path} "
           f"(after frozen-head training + fine-tuning) ---")
 
-print("\nAll models have finished training with corrected, architecture-specific "
-      "preprocessing, class-balanced loss, and backbone fine-tuning!")
+print("\nInceptionV3 has finished training with corrected preprocessing, "
+      "class-balanced loss, and backbone fine-tuning - matching the "
+      "train_multi.py regimen for the other 5 models!")

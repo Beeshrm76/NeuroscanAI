@@ -49,6 +49,7 @@ from tensorflow.keras.applications.resnet50 import preprocess_input as resnet50_
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
 from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
 from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
 
 from ensemble_utils import ENSEMBLE_MODEL_PATHS, load_ensemble_models, ensemble_predict_generator
 from metrics_utils import compute_and_save_metrics, write_summary_table
@@ -65,6 +66,7 @@ MODELS_TO_EVALUATE = [
     ('MobileNetV2', 'models/mobilenet_model.h5', mobilenet_preprocess, (150, 150)),
     ('DenseNet121', 'models/densenet_model.h5', densenet_preprocess, (150, 150)),
     ('EfficientNetB0', 'models/efficientnet_model.h5', efficientnet_preprocess, (150, 150)),
+    ('InceptionV3', 'models/inception_model.h5', inception_preprocess, (150, 150)),
 ]
 
 

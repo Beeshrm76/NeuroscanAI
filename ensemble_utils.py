@@ -3,38 +3,26 @@ Shared ensemble logic used by both app.py (live web predictions) and the
 evaluation scripts (evaluate_all.py, confidence_calibration.py,
 robustness_test.py, external_validation.py).
 
-WHY THIS FILE CHANGED (all-5 weighted ensemble + top-3 display)
+WHY THIS FILE CHANGED (all-6 weighted ensemble + top-3 display)
 ------------------------------------------------------------------
-Two SEPARATE things now happen, not one combined selection+ensemble
-step:
+Two SEPARATE things happen:
 
-1. THE ENSEMBLE PREDICTION uses ALL 5 models, always - not a dynamic
-   subset. Each model's probability vector is combined using a WEIGHTED
-   average, where the weight is that model's own overall test-set
-   ACCURACY (a fixed number from evaluate_all.py, MODEL_ACCURACY below),
-   normalized across all 5 so the weights sum to 1. A generally more
+1. THE ENSEMBLE PREDICTION uses ALL 6 models (VGG16, ResNet50, MobileNetV2,
+   DenseNet121, EfficientNetB0, InceptionV3). Each model's probability vector
+   is combined using a WEIGHTED average, where the weight is that model's own
+   overall test-set ACCURACY (from evaluate_all.py, MODEL_ACCURACY below),
+   normalized across all 6 so the weights sum to 1. A generally more
    reliable model (e.g. ResNet50 at 85.45%) always counts for more in
    the final ensemble prediction than a generally less reliable one
    (e.g. DenseNet121 at 68.50%), regardless of confidence on any single
    image.
 
-2. THE TOP-3-BY-CONFIDENCE LIST is purely informational now - it does
-   NOT feed into the ensemble prediction above. It's just "of these 5
+2. THE TOP-3-BY-CONFIDENCE LIST is purely informational - it does
+   NOT feed into the ensemble prediction above. It's just "of these 6
    individual model predictions, here are the 3 that were most
    confident on this specific image", shown alongside the ensemble
    result so a user can see which individual models were most sure of
-   themselves, without that affecting the actual combined answer.
-
-IMPORTANT CAVEATS:
-- MODEL_ACCURACY below must be kept in sync manually with whatever
-  evaluate_all.py's summary_metrics.csv actually reports after your most
-  recent training run - it is NOT computed automatically here.
-- Because the ensemble now always uses all 5 (weighted), a chronically
-  weak model (e.g. DenseNet121) still has SOME influence on every
-  prediction, just proportionally less than stronger models - it can no
-  longer be excluded entirely the way the earlier dynamic-selection
-  version could exclude it. If a much weaker model exists, this softens
-  but doesn't remove its drag on the ensemble.
+   themselves.
 """
 
 import numpy as np
@@ -46,14 +34,16 @@ from tensorflow.keras.applications.resnet50 import preprocess_input as resnet50_
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
 from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
 from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
 
-# All 5 trained architectures - the ensemble always combines all 5.
+# All 6 trained architectures - the ensemble combines all 6.
 ENSEMBLE_MODEL_PATHS = {
     'VGG16': 'models/vgg16_model.h5',
     'ResNet50': 'models/resnet50_model.h5',
     'MobileNetV2': 'models/mobilenet_model.h5',
     'DenseNet121': 'models/densenet_model.h5',
     'EfficientNetB0': 'models/efficientnet_model.h5',
+    'InceptionV3': 'models/inception_model.h5',
 }
 
 ENSEMBLE_MODEL_PREPROCESS = {
@@ -62,6 +52,7 @@ ENSEMBLE_MODEL_PREPROCESS = {
     'MobileNetV2': mobilenet_preprocess,
     'DenseNet121': densenet_preprocess,
     'EfficientNetB0': efficientnet_preprocess,
+    'InceptionV3': inception_preprocess,
 }
 
 ENSEMBLE_MODEL_IMG_SIZE = {
@@ -70,17 +61,19 @@ ENSEMBLE_MODEL_IMG_SIZE = {
     'MobileNetV2': (150, 150),
     'DenseNet121': (150, 150),
     'EfficientNetB0': (150, 150),
+    'InceptionV3': (150, 150),
 }
 
 # Overall test-set accuracy per model, from evaluate_all.py's most recent
 # run (summary_metrics.csv). Used as ensemble combination weights across
-# ALL 5 models. Update these manually after any retraining run.
+# ALL 6 models. Update these manually after any retraining run.
 MODEL_ACCURACY = {
     'VGG16': 0.7302,
     'ResNet50': 0.8545,
     'MobileNetV2': 0.7316,
     'DenseNet121': 0.6850,
     'EfficientNetB0': 0.7020,
+    'InceptionV3': 0.7218,
 }
 
 TOP_K_DISPLAY = 3  # how many individual models' confidences to surface for display

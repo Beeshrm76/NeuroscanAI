@@ -1,4 +1,7 @@
 import os
+import json
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, render_template, request, redirect, url_for, send_file
 from werkzeug.utils import secure_filename
 import tensorflow as tf
@@ -10,6 +13,7 @@ import pydicom
 from PIL import Image as PILImage
 from preprocess import get_data_generators
 from ensemble_utils import ensemble_predict_proba, ENSEMBLE_MODEL_PREPROCESS, ENSEMBLE_MODEL_IMG_SIZE
+from recommendation_utils import get_doctor_recommendations
 
 # ReportLab imports for PDF generation
 from reportlab.lib.pagesizes import letter
@@ -32,16 +36,14 @@ latest_patient_id = "N/A"
 latest_patient_age_gender = "N/A"
 latest_scan_modality = "Standard MRI"
 
-# Load all 5 trained architectures. Each prediction request dynamically
-# selects the 3 most confident of these 5 for the ensemble average - see
-# ensemble_utils.py's module docstring for the confidence-vs-accuracy
-# caveat on this approach.
+# Load all 6 trained architectures.
 models = {
     'VGG16': load_model('models/vgg16_model.h5'),
     'ResNet50': load_model('models/resnet50_model.h5'),
     'MobileNetV2': load_model('models/mobilenet_model.h5'),
     'DenseNet121': load_model('models/densenet_model.h5'),
     'EfficientNetB0': load_model('models/efficientnet_model.h5'),
+    'InceptionV3': load_model('models/inception_model.h5'),
 }
 
 # Dynamically load all class labels
@@ -88,25 +90,120 @@ def build_model_inputs(filepath):
     return x_by_model
 
 
+def analyze_image(filepath, filename):
+    """
+    Execute inference across all 5 architectures, compute accuracy-weighted
+    ensemble predictions, identify top 3 confident models, and generate Grad-CAM.
+    Updates global state and returns (results, top3, image_file, cam_file).
+    """
+    global latest_results, latest_top3, latest_image_file, latest_cam_file
+
+    x_by_model = build_model_inputs(filepath)
+    CONFIDENCE_THRESHOLD = 50.0
+
+    results = {}
+    for name, model in models.items():
+        preds = model.predict(x_by_model[name], verbose=0)
+        class_idx = np.argmax(preds[0])
+        confidence = float(np.max(preds[0])) * 100
+
+        if confidence < CONFIDENCE_THRESHOLD:
+            results[name] = {
+                'prediction': 'UNCERTAIN / LOW CONFIDENCE',
+                'confidence': round(confidence, 2)
+            }
+        else:
+            results[name] = {
+                'prediction': CLASSES[class_idx],
+                'confidence': round(confidence, 2)
+            }
+
+    ensemble_proba, weights_used, top_3_confidences = ensemble_predict_proba(models, x_by_model)
+    ensemble_class_idx = np.argmax(ensemble_proba)
+    ensemble_confidence = float(np.max(ensemble_proba)) * 100
+
+    ensemble_label = "Ensemble (All 6, accuracy-weighted)"
+    if ensemble_confidence < CONFIDENCE_THRESHOLD:
+        results[ensemble_label] = {
+            'prediction': 'UNCERTAIN / LOW CONFIDENCE',
+            'confidence': round(ensemble_confidence, 2)
+        }
+    else:
+        results[ensemble_label] = {
+            'prediction': CLASSES[ensemble_class_idx],
+            'confidence': round(ensemble_confidence, 2)
+        }
+
+    top_3_display = [
+        {'model': name, 'confidence': round(conf * 100, 2)}
+        for name, conf in top_3_confidences
+    ]
+
+    latest_results = results
+    latest_top3 = top_3_display
+    latest_image_file = filename
+
+    LAST_CONV_LAYER_BY_MODEL = {
+        'VGG16': 'block5_conv3',
+        'ResNet50': 'conv5_block3_out',
+        'MobileNetV2': 'out_relu',
+        'DenseNet121': 'conv5_block16_concat',
+        'EfficientNetB0': 'top_conv',
+        'InceptionV3': 'mixed10',
+    }
+
+    cam_filename = None
+    try:
+        cam_model_name = top_3_confidences[0][0]
+        cam_model = models[cam_model_name]
+        x_cam = x_by_model[cam_model_name]
+        last_conv_layer_name = LAST_CONV_LAYER_BY_MODEL[cam_model_name]
+
+        heatmap = make_gradcam_heatmap(x_cam, cam_model, last_conv_layer_name)
+
+        cam_filename = "cam_" + filename
+        cam_path = os.path.join(app.config['UPLOAD_FOLDER'], cam_filename)
+
+        original_img = cv2.imread(filepath)
+        heatmap_resized = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
+        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+        superimposed = cv2.addWeighted(original_img, 0.6, heatmap_colored, 0.4, 0)
+        cv2.imwrite(cam_path, superimposed)
+    except Exception as e:
+        print("Grad-CAM generation error:", e)
+
+    latest_cam_file = cam_filename
+    return results, top_3_display, filename, cam_filename
+
+
 @app.route('/')
 def home():
+    # Preserve analysis across page reload / refresh so it is never a goner
+    if latest_results and latest_image_file:
+        return render_template(
+            'index.html',
+            results=latest_results,
+            top3=latest_top3,
+            image_file=latest_image_file,
+            cam_file=latest_cam_file
+        )
     return render_template('index.html')
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    global latest_results, latest_top3, latest_image_file, latest_cam_file
     global latest_patient_id, latest_patient_age_gender, latest_scan_modality
 
     latest_patient_id = request.form.get('patient_id', 'N/A')
     latest_patient_age_gender = request.form.get('patient_age_gender', 'N/A')
     latest_scan_modality = request.form.get('scan_modality', 'Standard MRI')
 
-    if 'file' not in request.files:
+    if 'file' not in request.files or request.files['file'].filename == '':
+        if latest_image_file:
+            return redirect(url_for('reanalyze'))
         return redirect(request.url)
+
     file = request.files['file']
-    if file.filename == '':
-        return redirect(request.url)
 
     if file:
         filename = secure_filename(file.filename)
@@ -144,181 +241,169 @@ def predict():
             except Exception as e:
                 print("DICOM parsing error:", e)
 
-        latest_image_file = filename
+        results, top3, image_file, cam_file = analyze_image(filepath, filename)
+        return render_template('index.html', results=results, top3=top3, image_file=image_file, cam_file=cam_file)
 
-        # Build per-model correctly-preprocessed inputs (see
-        # build_model_inputs docstring for why this can't be one shared
-        # array anymore).
-        x_by_model = build_model_inputs(filepath)
 
-        CONFIDENCE_THRESHOLD = 50.0
+@app.route('/reanalyze', methods=['GET', 'POST'])
+def reanalyze():
+    """Re-analyze the current MRI scan across all models and regenerate Grad-CAM."""
+    global latest_image_file
+    if not latest_image_file:
+        return redirect(url_for('home'))
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], latest_image_file)
+    if not os.path.exists(filepath):
+        return redirect(url_for('home'))
+    results, top3, image_file, cam_file = analyze_image(filepath, latest_image_file)
+    return render_template('index.html', results=results, top3=top3, image_file=image_file, cam_file=cam_file)
 
-        results = {}
-        for name, model in models.items():
-            preds = model.predict(x_by_model[name], verbose=0)
-            class_idx = np.argmax(preds[0])
-            confidence = float(np.max(preds[0])) * 100
 
-            if confidence < CONFIDENCE_THRESHOLD:
-                results[name] = {
-                    'prediction': 'UNCERTAIN / LOW CONFIDENCE',
-                    'confidence': round(confidence, 2)
-                }
-            else:
-                results[name] = {
-                    'prediction': CLASSES[class_idx],
-                    'confidence': round(confidence, 2)
-                }
+@app.route('/reset')
+def reset():
+    """Clear active scan results to cleanly start the next scan upload."""
+    global latest_results, latest_top3, latest_image_file, latest_cam_file
+    global latest_patient_id, latest_patient_age_gender, latest_scan_modality
+    latest_results = {}
+    latest_top3 = []
+    latest_image_file = None
+    latest_cam_file = None
+    latest_patient_id = "N/A"
+    latest_patient_age_gender = "N/A"
+    latest_scan_modality = "Standard MRI"
+    return redirect(url_for('home'))
 
-        # Ensemble prediction: ALL 5 models combined, weighted by each
-        # model's known overall accuracy (MODEL_ACCURACY in
-        # ensemble_utils.py) - NOT restricted to a subset. Separately,
-        # top_3_confidences reports which 3 individual models were most
-        # confident on THIS image, purely for display - it does not
-        # affect the ensemble prediction above.
-        ensemble_proba, weights_used, top_3_confidences = ensemble_predict_proba(models, x_by_model)
-        ensemble_class_idx = np.argmax(ensemble_proba)
-        ensemble_confidence = float(np.max(ensemble_proba)) * 100
 
-        ensemble_label = "Ensemble (All 5, accuracy-weighted)"
-        if ensemble_confidence < CONFIDENCE_THRESHOLD:
-            results[ensemble_label] = {
-                'prediction': 'UNCERTAIN / LOW CONFIDENCE',
-                'confidence': round(ensemble_confidence, 2)
-            }
-        else:
-            results[ensemble_label] = {
-                'prediction': CLASSES[ensemble_class_idx],
-                'confidence': round(ensemble_confidence, 2)
-            }
-
-        # Top-3-by-confidence display: informational only, shown
-        # alongside the ensemble result so the UI can list "most
-        # confident individual models" without it changing the ensemble
-        # answer above.
-        top_3_display = [
-            {'model': name, 'confidence': round(conf * 100, 2)}
-            for name, conf in top_3_confidences
-        ]
-
-        latest_results = results
-        latest_top3 = top_3_display
-
-        # Generate Grad-CAM Heatmap using whichever individual model had
-        # the HIGHEST confidence on this image (top_3_confidences[0],
-        # informational list from above, highest-confidence-first).
-        # Different uploads can therefore produce Grad-CAM from a
-        # different architecture - each needs its own last-conv-layer
-        # name.
-        # NOTE: these layer names are the standard ones for
-        # keras.applications' architectures but can vary slightly by
-        # TensorFlow/Keras version - if Grad-CAM silently fails (caught
-        # below and logged, not crashing the request), print(model.summary())
-        # for that architecture and confirm/adjust the name here.
-        LAST_CONV_LAYER_BY_MODEL = {
-            'VGG16': 'block5_conv3',
-            'ResNet50': 'conv5_block3_out',
-            'MobileNetV2': 'out_relu',
-            'DenseNet121': 'conv5_block16_concat',
-            'EfficientNetB0': 'top_conv',
-        }
-
-        cam_filename = None
-        try:
-            cam_model_name = top_3_confidences[0][0]
-            cam_model = models[cam_model_name]
-            x_cam = x_by_model[cam_model_name]
-            last_conv_layer_name = LAST_CONV_LAYER_BY_MODEL[cam_model_name]
-
-            heatmap = make_gradcam_heatmap(x_cam, cam_model, last_conv_layer_name)
-
-            cam_filename = "cam_" + filename
-            cam_path = os.path.join(app.config['UPLOAD_FOLDER'], cam_filename)
-
-            original_img = cv2.imread(filepath)
-            heatmap_resized = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
-            heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-            superimposed = cv2.addWeighted(original_img, 0.6, heatmap_colored, 0.4, 0)
-            cv2.imwrite(cam_path, superimposed)
-        except Exception as e:
-            print("Grad-CAM generation error:", e)
-
-        latest_cam_file = cam_filename
-        return render_template('index.html', results=results, top3=top_3_display, image_file=filename, cam_file=cam_filename)
+@app.route('/api/recommend_doctors', methods=['POST'])
+def recommend_doctors_api():
+    data = request.get_json()
+    city = data.get('city')
+    tumor_class = data.get('tumor_class')
+    
+    if not city or not tumor_class:
+        return {"error": "Missing city or tumor_class"}, 400
+        
+    print(f"AJAX: Fetching doctors for {tumor_class} in {city}...")
+    recommendations, err_msg = get_doctor_recommendations(tumor_class, city)
+    
+    if recommendations:
+        return {"success": True, "data": recommendations}, 200
+    else:
+        return {"success": False, "error": err_msg or "Failed to fetch recommendations from LLM"}, 500
 
 
 @app.route('/download_report')
 def download_report():
     if not latest_image_file or not latest_results:
+        print("Export failed: No latest_image_file or latest_results found (Server might have restarted).")
         return redirect(url_for('home'))
 
-    pdf_path = os.path.join(UPLOAD_FOLDER, 'diagnostic_report.pdf')
-    doc = SimpleDocTemplate(pdf_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-    story = []
-    styles = getSampleStyleSheet()
+    try:
+        pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], 'diagnostic_report.pdf')
+        doc = SimpleDocTemplate(pdf_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+        story = []
+        styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#0f172a'), spaceAfter=4)
-    subtitle_style = ParagraphStyle('SubTitleStyle', parent=styles['Normal'], fontSize=10, textColor=colors.HexColor('#64748b'), spaceAfter=15)
-    heading_style = ParagraphStyle('HeadingStyle', parent=styles['Heading2'], fontSize=12, textColor=colors.HexColor('#0284c7'), spaceBefore=8, spaceAfter=4)
+        title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#0f172a'), spaceAfter=4)
+        subtitle_style = ParagraphStyle('SubTitleStyle', parent=styles['Normal'], fontSize=10, textColor=colors.HexColor('#64748b'), spaceAfter=15)
+        heading_style = ParagraphStyle('HeadingStyle', parent=styles['Heading2'], fontSize=12, textColor=colors.HexColor('#0284c7'), spaceBefore=8, spaceAfter=4)
 
-    story.append(Paragraph("NeuroScan AI &bull; Clinical Diagnostic Report", title_style))
-    story.append(Paragraph("Automated Multi-Model Ensemble Brain Tumor Classification System", subtitle_style))
+        story.append(Paragraph("NeuroScan AI &bull; Clinical Diagnostic Report", title_style))
+        story.append(Paragraph("Automated Multi-Model Ensemble Brain Tumor Classification System", subtitle_style))
 
-    data_meta = [
-        [Paragraph(f"<b>Patient ID:</b> {latest_patient_id}", styles['Normal']),
-         Paragraph(f"<b>Modality:</b> {latest_scan_modality}", styles['Normal'])],
-        [Paragraph(f"<b>Age / Gender:</b> {latest_patient_age_gender}", styles['Normal']),
-         Paragraph("<b>Status:</b> Verified Analysis", styles['Normal'])]
-    ]
-    t_meta = Table(data_meta, colWidths=[270, 270])
-    t_meta.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f1f5f9')),
-        ('PADDING', (0,0), (-1,-1), 6),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-    ]))
-    story.append(t_meta)
-    story.append(Spacer(1, 10))
+        data_meta = [
+            [Paragraph(f"<b>Patient ID:</b> {latest_patient_id}", styles['Normal']),
+             Paragraph(f"<b>Modality:</b> {latest_scan_modality}", styles['Normal'])],
+            [Paragraph(f"<b>Age / Gender:</b> {latest_patient_age_gender}", styles['Normal']),
+             Paragraph("<b>Status:</b> Verified Analysis", styles['Normal'])]
+        ]
+        t_meta = Table(data_meta, colWidths=[270, 270])
+        t_meta.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f1f5f9')),
+            ('PADDING', (0,0), (-1,-1), 6),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ]))
+        story.append(t_meta)
+        story.append(Spacer(1, 10))
 
-    story.append(Paragraph("Ensemble Model Predictions", heading_style))
-    table_data = [["Model Architecture", "Predicted Classification", "Confidence Score"]]
-    for model_name, res in latest_results.items():
-        table_data.append([model_name, res['prediction'], f"{res['confidence']}%"])
+        story.append(Paragraph("Ensemble Model Predictions", heading_style))
 
-    t_results = Table(table_data, colWidths=[150, 270, 120])
-    t_results.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0284c7')),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 6),
-        ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f8fafc')),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-        ('PADDING', (0,0), (-1,-1), 6),
-    ]))
-    story.append(t_results)
-    story.append(Spacer(1, 10))
+        cell_head = ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold', textColor=colors.white)
+        cell_head_center = ParagraphStyle('THC', parent=cell_head, alignment=1)
+        cell_body = ParagraphStyle('TD', parent=styles['Normal'], fontSize=9, leading=12, textColor=colors.HexColor('#1e293b'))
+        cell_body_bold = ParagraphStyle('TDBold', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#0f172a'))
+        cell_body_center = ParagraphStyle('TDCenter', parent=cell_body, alignment=1)
+        cell_body_center_bold = ParagraphStyle('TDCenterBold', parent=cell_body_bold, alignment=1)
 
-    story.append(Paragraph("Visual Analysis & Grad-CAM Heatmap", heading_style))
-    img_path = os.path.join(UPLOAD_FOLDER, latest_image_file)
-    cam_path = os.path.join(UPLOAD_FOLDER, latest_cam_file) if latest_cam_file else None
+        table_data = [[
+            Paragraph("Model Architecture", cell_head),
+            Paragraph("Predicted Classification", cell_head),
+            Paragraph("Confidence Score", cell_head_center)
+        ]]
 
-    img_row = []
-    if os.path.exists(img_path):
-        img_row.append(RLImage(img_path, width=120, height=120))
-    if cam_path and os.path.exists(cam_path):
-        img_row.append(RLImage(cam_path, width=120, height=120))
+        for model_name, res in latest_results.items():
+            is_ens = 'Ensemble' in model_name
+            m_style = cell_body_bold if is_ens else cell_body
+            p_style = cell_body_bold if is_ens else cell_body
+            c_style = cell_body_center_bold if is_ens else cell_body_center
 
-    if img_row:
-        t_imgs = Table([img_row], colWidths=[270]*len(img_row))
-        t_imgs.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER')]))
-        story.append(t_imgs)
+            table_data.append([
+                Paragraph(model_name, m_style),
+                Paragraph(str(res['prediction']), p_style),
+                Paragraph(f"{res['confidence']}%", c_style)
+            ])
 
-    story.append(Spacer(1, 15))
+        # Widths: 190 + 230 + 120 = 540 pt (matches full printable width, wraps long labels cleanly)
+        t_results = Table(table_data, colWidths=[190, 230, 120])
+        t_results.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0284c7')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f8fafc')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ]))
+        story.append(t_results)
+        story.append(Spacer(1, 12))
 
-    disclaimer_style = ParagraphStyle('Disclaimer', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#94a3b8'))
-    story.append(Paragraph("<b>Disclaimer:</b> This report is generated automatically by a computer vision research project prototype (NeuroScan AI). It serves as a preliminary diagnostic aid and must be reviewed by certified medical professionals prior to clinical decisions.", disclaimer_style))
+        story.append(Paragraph("Visual Analysis & Grad-CAM Heatmap", heading_style))
+        img_path = os.path.join(app.config['UPLOAD_FOLDER'], latest_image_file)
+        cam_path = os.path.join(app.config['UPLOAD_FOLDER'], latest_cam_file) if latest_cam_file else None
 
-    doc.build(story)
-    return send_file(pdf_path, as_attachment=True)
+        img_cells = []
+        caption_cells = []
+        col_widths = []
+        caption_style = ParagraphStyle('ImgCaption', parent=styles['Normal'], fontSize=8, leading=10, alignment=1, textColor=colors.HexColor('#475569'))
+
+        if os.path.exists(img_path):
+            img_cells.append(RLImage(img_path, width=130, height=130))
+            caption_cells.append(Paragraph("<b>Input MRI Scan</b>", caption_style))
+            col_widths.append(270)
+        if cam_path and os.path.exists(cam_path):
+            img_cells.append(RLImage(cam_path, width=130, height=130))
+            caption_cells.append(Paragraph("<b>AI Grad-CAM Heatmap</b>", caption_style))
+            col_widths.append(270)
+
+        if img_cells:
+            t_imgs = Table([img_cells, caption_cells], colWidths=col_widths)
+            t_imgs.setStyle(TableStyle([
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('TOPPADDING', (0,1), (-1,1), 4),
+                ('BOTTOMPADDING', (0,1), (-1,1), 6),
+            ]))
+            story.append(t_imgs)
+
+        story.append(Spacer(1, 15))
+
+        disclaimer_style = ParagraphStyle('Disclaimer', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#94a3b8'))
+        story.append(Paragraph("<b>Disclaimer:</b> This report is generated automatically by a computer vision research project prototype (NeuroScan AI). It serves as a preliminary diagnostic aid and must be reviewed by certified medical professionals prior to clinical decisions.", disclaimer_style))
+
+        doc.build(story)
+        return send_file(pdf_path, as_attachment=True)
+    except Exception as e:
+        print(f"Error generating PDF report: {e}")
+        return f"An error occurred while generating the report: {e}", 500
 
 
 if __name__ == '__main__':
