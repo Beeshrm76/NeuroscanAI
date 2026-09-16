@@ -3,17 +3,28 @@ Shared ensemble logic used by both app.py (live web predictions) and the
 evaluation scripts (evaluate_all.py, confidence_calibration.py,
 robustness_test.py, external_validation.py).
 
-WHY THIS FILE CHANGED (6-model ensemble + native resolutions)
+WHY THIS FILE CHANGED (all-6 weighted ensemble + top-3 display)
 ------------------------------------------------------------------
-1. INCEPTIONV3 ADDED AS A 6TH ENSEMBLE MEMBER across all dicts.
-2. EVERY MODEL'S IMG_SIZE NOW MATCHES train_multi.py's NATIVE RESOLUTIONS:
-   - 224x224 for VGG16, ResNet50, MobileNetV2, DenseNet121, EfficientNetB0
-   - 299x299 for InceptionV3
-3. PRESERVED STANDARDS: The previous 150px configuration is preserved in
-   ensemble_utils_standard.py for comparison.
+Two SEPARATE things happen:
+
+1. THE ENSEMBLE PREDICTION uses ALL 6 models (VGG16, ResNet50, MobileNetV2,
+   DenseNet121, EfficientNetB0, InceptionV3). Each model's probability vector
+   is combined using a WEIGHTED average, where the weight is that model's own
+   overall test-set ACCURACY (from evaluate_all.py, MODEL_ACCURACY below),
+   normalized across all 6 so the weights sum to 1. A generally more
+   reliable model (e.g. ResNet50 at 85.45%) always counts for more in
+   the final ensemble prediction than a generally less reliable one
+   (e.g. DenseNet121 at 68.50%), regardless of confidence on any single
+   image.
+
+2. THE TOP-3-BY-CONFIDENCE LIST is purely informational - it does
+   NOT feed into the ensemble prediction above. It's just "of these 6
+   individual model predictions, here are the 3 that were most
+   confident on this specific image", shown alongside the ensemble
+   result so a user can see which individual models were most sure of
+   themselves.
 """
 
-import os
 import numpy as np
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -25,24 +36,14 @@ from tensorflow.keras.applications.densenet import preprocess_input as densenet_
 from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
 from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
 
-# All 6 trained architectures - the ensemble always combines all 6.
+# All 6 trained architectures (Standard 150px baseline)
 ENSEMBLE_MODEL_PATHS = {
-    'VGG16': 'models/vgg16_model.h5',
-    'ResNet50': 'models/resnet50_model.h5',
-    'MobileNetV2': 'models/mobilenet_model.h5',
-    'DenseNet121': 'models/densenet_model.h5',
-    'EfficientNetB0': 'models/efficientnet_model.h5',
-    'InceptionV3': 'models/inception_model.h5',
-}
-
-# Also support explicit native model path directory
-ENSEMBLE_MODEL_NATIVE_PATHS = {
-    'VGG16': 'models_native/vgg16_model.h5',
-    'ResNet50': 'models_native/resnet50_model.h5',
-    'MobileNetV2': 'models_native/mobilenet_model.h5',
-    'DenseNet121': 'models_native/densenet_model.h5',
-    'EfficientNetB0': 'models_native/efficientnet_model.h5',
-    'InceptionV3': 'models_native/inception_model.h5',
+    'VGG16': 'models_standard/vgg16_model.h5',
+    'ResNet50': 'models_standard/resnet50_model.h5',
+    'MobileNetV2': 'models_standard/mobilenet_model.h5',
+    'DenseNet121': 'models_standard/densenet_model.h5',
+    'EfficientNetB0': 'models_standard/efficientnet_model.h5',
+    'InceptionV3': 'models_standard/inception_model.h5',
 }
 
 ENSEMBLE_MODEL_PREPROCESS = {
@@ -54,14 +55,13 @@ ENSEMBLE_MODEL_PREPROCESS = {
     'InceptionV3': inception_preprocess,
 }
 
-# Native ImageNet resolutions matching train_multi.py / train_multi_native.py
 ENSEMBLE_MODEL_IMG_SIZE = {
-    'VGG16': (224, 224),
+    'VGG16': (150, 150),
     'ResNet50': (224, 224),
-    'MobileNetV2': (224, 224),
-    'DenseNet121': (224, 224),
-    'EfficientNetB0': (224, 224),
-    'InceptionV3': (299, 299),
+    'MobileNetV2': (150, 150),
+    'DenseNet121': (150, 150),
+    'EfficientNetB0': (150, 150),
+    'InceptionV3': (150, 150),
 }
 
 # Overall test-set accuracy per model, from evaluate_all.py's most recent
@@ -80,19 +80,9 @@ TOP_K_DISPLAY = 3  # how many individual models' confidences to surface for disp
 
 
 def load_ensemble_models(model_paths=None):
-    """Load the models that make up the ensemble. Checks paths with fallback."""
-    paths = model_paths or ENSEMBLE_MODEL_PATHS
-    loaded = {}
-    for name, path in paths.items():
-        if os.path.exists(path):
-            loaded[name] = load_model(path)
-        elif name in ENSEMBLE_MODEL_NATIVE_PATHS and os.path.exists(ENSEMBLE_MODEL_NATIVE_PATHS[name]):
-            loaded[name] = load_model(ENSEMBLE_MODEL_NATIVE_PATHS[name])
-        elif os.path.exists(f"models_standard/{os.path.basename(path)}"):
-            loaded[name] = load_model(f"models_standard/{os.path.basename(path)}")
-        else:
-            raise FileNotFoundError(f"Model file for {name} not found at {path}")
-    return loaded
+    """Load the models that make up the ensemble. Returns {name: model}."""
+    model_paths = model_paths or ENSEMBLE_MODEL_PATHS
+    return {name: load_model(path) for name, path in model_paths.items()}
 
 
 def weighted_ensemble_proba(individual_probas: dict, weights: dict = None):
@@ -123,12 +113,21 @@ def top_k_by_confidence(individual_probas: dict, k: int = TOP_K_DISPLAY):
 
 
 def ensemble_predict_proba(models: dict, x_by_model: dict, weights: dict = None,
-                           top_k_display: int = TOP_K_DISPLAY):
+                            top_k_display: int = TOP_K_DISPLAY):
     """
-    Run all models on a single input, combine ALL of them into one
+    Run all 5 models on a single input, combine ALL of them into one
     weighted-average ensemble prediction (weighted by MODEL_ACCURACY),
     and separately report the top-k most individually-confident models
     for display purposes only.
+
+    Returns (proba_weighted, weights_used, top_k_confidences):
+      proba_weighted    - weighted-average probability vector over ALL
+                           models, shape (num_classes,)
+      weights_used       - {model_name: normalized_weight} for all models
+                            actually used in the ensemble
+      top_k_confidences  - list of (model_name, confidence) for the top-k
+                            most confident individual models on this
+                            image, informational only
     """
     individual_probas = {
         name: model.predict(x_by_model[name], verbose=0)[0]
@@ -141,10 +140,19 @@ def ensemble_predict_proba(models: dict, x_by_model: dict, weights: dict = None,
 
 def ensemble_predict_generator(models: dict, test_dir, batch_size=32, weights: dict = None):
     """
-    Run the all-models, accuracy-weighted ensemble over the test set on
-    disk, building a SEPARATE correctly-preprocessed generator for each
-    model at its native resolution, then combining all models' probabilities
-    per test image using the accuracy weights.
+    Run the all-5, accuracy-weighted ensemble over the test set on disk,
+    building a SEPARATE correctly-preprocessed generator for each model,
+    then combining ALL 5 models' probabilities per test image using the
+    same accuracy weights used in production - so this evaluation is a
+    true measurement of what app.py actually serves.
+
+    `test_dir` is the path to the test folder on disk (e.g.
+    'dataset/Testing').
+
+    Returns (y_true, y_pred, y_proba):
+      y_true  - ground-truth class indices, shape (N,)
+      y_pred  - ensemble argmax predictions, shape (N,)
+      y_proba - ensemble weighted-average probabilities, shape (N, num_classes)
     """
     weights = weights or MODEL_ACCURACY
     per_model_preds = {}
@@ -175,6 +183,8 @@ def ensemble_predict_generator(models: dict, test_dir, batch_size=32, weights: d
     raw_weights = np.array([weights[name] for name in names], dtype=np.float64)
     norm_weights = raw_weights / raw_weights.sum()
 
+    # Weighted average across all samples at once: stack into
+    # (n_models, n_samples, n_classes), then weight along the model axis.
     stacked = np.array([per_model_preds[name] for name in names])  # (n_models, N, C)
     y_proba = np.tensordot(norm_weights, stacked, axes=(0, 0))  # (N, C)
     y_pred = np.argmax(y_proba, axis=1)

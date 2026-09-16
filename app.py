@@ -1,13 +1,15 @@
 import os
 import json
+import glob
 from dotenv import load_dotenv
 load_dotenv()
-from flask import Flask, render_template, request, redirect, url_for, send_file
+from flask import Flask, render_template, request, redirect, url_for, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 import numpy as np
+import pandas as pd
 import cv2
 import pydicom
 from PIL import Image as PILImage
@@ -27,6 +29,17 @@ app = Flask(__name__)
 UPLOAD_FOLDER = 'static/uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# Directories for evaluation metrics & training curves
+EVALUATION_RESULTS_DIR = 'evaluation_results'
+EVALUATION_RESULTS_NATIVE_DIR = 'evaluation_results_native'
+EVALUATION_RESULTS_STANDARD_DIR = 'evaluation_results_standard'
+
+TRAINING_HISTORY_DIR = 'training_history'
+TRAINING_HISTORY_NATIVE_DIR = 'training_history_native'
+TRAINING_HISTORY_STANDARD_DIR = 'training_history_standard'
+
+CONFUSION_MATRIX_FILENAME = "{model}_confusion_matrix.png"
+
 # Global session variables
 latest_results = {}
 latest_top3 = []
@@ -36,14 +49,31 @@ latest_patient_id = "N/A"
 latest_patient_age_gender = "N/A"
 latest_scan_modality = "Standard MRI"
 
-# Load all 6 trained architectures.
+
+def resolve_model_path(model_filename):
+    """Resolve model weights path with graceful fallbacks:
+    models_native/ -> models/ -> models_standard/
+    """
+    candidates = [
+        os.path.join('models_native', model_filename),
+        os.path.join('models', model_filename),
+        os.path.join('models_standard', model_filename)
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return os.path.join('models', model_filename)
+
+
+# Load all 6 trained architectures. Every prediction combines ALL 6 via a
+# fixed, accuracy-weighted average (see ensemble_utils.py).
 models = {
-    'VGG16': load_model('models/vgg16_model.h5'),
-    'ResNet50': load_model('models/resnet50_model.h5'),
-    'MobileNetV2': load_model('models/mobilenet_model.h5'),
-    'DenseNet121': load_model('models/densenet_model.h5'),
-    'EfficientNetB0': load_model('models/efficientnet_model.h5'),
-    'InceptionV3': load_model('models/inception_model.h5'),
+    'VGG16': load_model(resolve_model_path('vgg16_model.h5')),
+    'ResNet50': load_model(resolve_model_path('resnet50_model.h5')),
+    'MobileNetV2': load_model(resolve_model_path('mobilenet_model.h5')),
+    'DenseNet121': load_model(resolve_model_path('densenet_model.h5')),
+    'EfficientNetB0': load_model(resolve_model_path('efficientnet_model.h5')),
+    'InceptionV3': load_model(resolve_model_path('inception_model.h5')),
 }
 
 # Dynamically load all class labels
@@ -73,11 +103,9 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
 def build_model_inputs(filepath):
     """
     Build a SEPARATE, correctly-preprocessed input array per model, since
-    each of the 5 architectures (VGG16, ResNet50, MobileNetV2,
-    DenseNet121, EfficientNetB0) requires its own preprocess_input
-    function - a single shared array (e.g. raw /255.0) is only correct
-    for one of them and silently corrupts predictions from the others.
-    See ensemble_utils.py for why this matters.
+    each of the 6 architectures (VGG16, ResNet50, MobileNetV2,
+    DenseNet121, EfficientNetB0, InceptionV3) requires its own
+    preprocess_input function and native input resolution.
     """
     x_by_model = {}
     for name in models.keys():
@@ -92,7 +120,7 @@ def build_model_inputs(filepath):
 
 def analyze_image(filepath, filename):
     """
-    Execute inference across all 5 architectures, compute accuracy-weighted
+    Execute inference across all 6 architectures, compute accuracy-weighted
     ensemble predictions, identify top 3 confident models, and generate Grad-CAM.
     Updates global state and returns (results, top3, image_file, cam_file).
     """
@@ -178,7 +206,6 @@ def analyze_image(filepath, filename):
 
 @app.route('/')
 def home():
-    # Preserve analysis across page reload / refresh so it is never a goner
     if latest_results and latest_image_file:
         return render_template(
             'index.html',
@@ -211,7 +238,7 @@ def predict():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
-        # Advanced DICOM Handling (.dcm files)
+        # DICOM Handling (.dcm files)
         if filename.lower().endswith('.dcm'):
             try:
                 dicom_data = pydicom.dcmread(filepath)
@@ -247,7 +274,7 @@ def predict():
 
 @app.route('/reanalyze', methods=['GET', 'POST'])
 def reanalyze():
-    """Re-analyze the current MRI scan across all models and regenerate Grad-CAM."""
+    """Re-analyze current MRI scan across all models and regenerate Grad-CAM."""
     global latest_image_file
     if not latest_image_file:
         return redirect(url_for('home'))
@@ -291,10 +318,88 @@ def recommend_doctors_api():
         return {"success": False, "error": err_msg or "Failed to fetch recommendations from LLM"}, 500
 
 
+@app.route('/performance')
+def performance():
+    """
+    Model-performance dashboard: accuracy/precision/recall/F1 comparison
+    across all 6 models + ensemble, confusion matrices, and per-model
+    train/val loss+accuracy curves.
+    """
+    summary_records = []
+    is_native = False
+
+    # Check for active or native results first, fall back to standard if needed
+    summary_candidates = [
+        (os.path.join(EVALUATION_RESULTS_NATIVE_DIR, 'summary_metrics.csv'), True),
+        (os.path.join(EVALUATION_RESULTS_DIR, 'summary_metrics.csv'), False),
+        (os.path.join(EVALUATION_RESULTS_STANDARD_DIR, 'summary_metrics.csv'), False),
+    ]
+
+    for cand_path, is_nat in summary_candidates:
+        if os.path.exists(cand_path):
+            try:
+                df = pd.read_csv(cand_path)
+                if not df.empty:
+                    summary_records = df.to_dict(orient='records')
+                    is_native = is_nat
+                    break
+            except Exception as e:
+                print(f"Error reading {cand_path}: {e}")
+
+    model_names = [row.get('run_name', row.get('model', row.get('name', ''))) for row in summary_records]
+
+    confusion_matrices = {}
+    search_dirs = [EVALUATION_RESULTS_DIR, EVALUATION_RESULTS_NATIVE_DIR, EVALUATION_RESULTS_STANDARD_DIR]
+
+    for name in model_names:
+        if not name:
+            continue
+        found = False
+        for sdir in search_dirs:
+            candidate = os.path.join(sdir, CONFUSION_MATRIX_FILENAME.format(model=name))
+            if os.path.exists(candidate):
+                confusion_matrices[name] = os.path.basename(candidate)
+                found = True
+                break
+
+    training_curves = {}
+    history_dirs = [TRAINING_HISTORY_DIR, TRAINING_HISTORY_NATIVE_DIR, TRAINING_HISTORY_STANDARD_DIR]
+
+    for hdir in history_dirs:
+        if not os.path.exists(hdir):
+            continue
+        for path in glob.glob(os.path.join(hdir, '*_history.json')):
+            model_key = os.path.basename(path).replace('_history.json', '')
+            if model_key not in training_curves:
+                try:
+                    with open(path) as f:
+                        training_curves[model_key] = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+    return render_template(
+        'dashboard.html',
+        summary_records=summary_records,
+        confusion_matrices=confusion_matrices,
+        training_curves=training_curves,
+        is_native=is_native,
+    )
+
+
+@app.route('/evaluation_results/<path:filename>')
+def evaluation_result_file(filename):
+    """Serves confusion matrix images with fallback across evaluation directories."""
+    for folder in [EVALUATION_RESULTS_DIR, EVALUATION_RESULTS_NATIVE_DIR, EVALUATION_RESULTS_STANDARD_DIR]:
+        target = os.path.join(folder, filename)
+        if os.path.exists(target):
+            return send_from_directory(folder, filename)
+    return "File not found", 404
+
+
 @app.route('/download_report')
 def download_report():
     if not latest_image_file or not latest_results:
-        print("Export failed: No latest_image_file or latest_results found (Server might have restarted).")
+        print("Export failed: No latest_image_file or latest_results found.")
         return redirect(url_for('home'))
 
     try:
@@ -352,7 +457,6 @@ def download_report():
                 Paragraph(f"{res['confidence']}%", c_style)
             ])
 
-        # Widths: 190 + 230 + 120 = 540 pt (matches full printable width, wraps long labels cleanly)
         t_results = Table(table_data, colWidths=[190, 230, 120])
         t_results.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0284c7')),

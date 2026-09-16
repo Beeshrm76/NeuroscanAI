@@ -129,8 +129,14 @@
                 </div>
                 <span class="text-lg font-bold tracking-tight bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">NeuroScan AI</span>
             </div>
-            <div class="text-xs font-medium px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-cyan-400">
-                Multi-Model Ensemble Engine
+            <div class="flex items-center space-x-3 sm:space-x-4">
+                <a href="{{ url_for('performance') }}" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-cyan-500/50 text-cyan-400 hover:text-cyan-300 transition-all flex items-center space-x-1.5 shadow-sm">
+                    <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                    <span>Model Performance</span>
+                </a>
+                <div class="text-xs font-medium px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-cyan-400 hidden sm:block">
+                    Multi-Model Ensemble Engine
+                </div>
             </div>
         </div>
     </header>
@@ -140,7 +146,7 @@
         
         <div class="text-center mb-10">
             <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight text-white mb-3">Brain Tumor MRI Diagnostics</h1>
-            <p class="text-slate-400 text-sm sm:text-base max-w-xl mx-auto">Upload an MRI scan to run real-time classification across all 5 models (VGG16, ResNet50, MobileNetV2, DenseNet121, EfficientNetB0) and a weighted ensemble simultaneously.</p>
+            <p class="text-slate-400 text-sm sm:text-base max-w-xl mx-auto">Upload an MRI scan to run real-time classification across all 6 models (VGG16, ResNet50, MobileNetV2, DenseNet121, EfficientNetB0, InceptionV3) and a weighted ensemble simultaneously.</p>
         </div>
 
         <!-- Upload Card -->
@@ -211,7 +217,7 @@
             </div>
 
             <!-- BIG ENSEMBLE RESULT -->
-            {% set ensemble_name = "Ensemble (All 5, accuracy-weighted)" %}
+            {% set ensemble_name = "Ensemble (All 6, accuracy-weighted)" %}
             {% if ensemble_name in results %}
             {% set ens_data = results[ensemble_name] %}
             <div class="bg-slate-900/80 border-2 border-cyan-500 rounded-2xl p-8 mb-8 flex flex-col items-center justify-center text-center shadow-[0_0_15px_rgba(6,182,212,0.3)]">
