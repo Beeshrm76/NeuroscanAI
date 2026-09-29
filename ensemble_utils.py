@@ -15,15 +15,15 @@ WHY THIS FILE CHANGED (6-model ensemble + native resolutions)
 
 import os
 import numpy as np
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-from tensorflow.keras.applications.vgg16 import preprocess_input as vgg16_preprocess
-from tensorflow.keras.applications.resnet50 import preprocess_input as resnet50_preprocess
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
-from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
-from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
-from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
+from keras.applications.vgg16 import preprocess_input as vgg16_preprocess
+from keras.applications.resnet50 import preprocess_input as resnet50_preprocess
+from keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
+from keras.applications.densenet import preprocess_input as densenet_preprocess
+from keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from keras.applications.inception_v3 import preprocess_input as inception_preprocess
 
 # All 6 trained architectures - the ensemble always combines all 6.
 ENSEMBLE_MODEL_PATHS = {
@@ -56,12 +56,12 @@ ENSEMBLE_MODEL_PREPROCESS = {
 
 # Native ImageNet resolutions matching train_multi.py / train_multi_native.py
 ENSEMBLE_MODEL_IMG_SIZE = {
-    'VGG16': (224, 224),
+    'VGG16': (150, 150),
     'ResNet50': (224, 224),
-    'MobileNetV2': (224, 224),
-    'DenseNet121': (224, 224),
-    'EfficientNetB0': (224, 224),
-    'InceptionV3': (299, 299),
+    'MobileNetV2': (150, 150),
+    'DenseNet121': (150, 150),
+    'EfficientNetB0': (150, 150),
+    'InceptionV3': (150, 150),
 }
 
 # Overall test-set accuracy per model, from evaluate_all.py's most recent

@@ -7,3 +7,6 @@ instance/
 node_modules
 *.zip
 models/_old_broken_preprocessing/*
+static/images/
+static/uploads/*.jpeg
+static/uploads/*.jpg
